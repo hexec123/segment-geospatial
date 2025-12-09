@@ -687,6 +687,7 @@ class SamGeo3:
         min_size: int = 0,
         max_size: Optional[int] = None,
         dtype: str = "uint8",
+        binary: bool = False,
         **kwargs: Any,
     ) -> List[str]:
         """Save masks from batch processing to files.
@@ -786,18 +787,32 @@ class SamGeo3:
                 )
             mask_array = mask_array.astype(dtype)
 
-            # Determine output path and extension
+            # If user requested binary masks, enforce binary behavior
+            if binary:
+                unique = False
+                dtype = "uint8"
+
+            # Determine output filename based on source image name when possible
+            if source is not None:
+                stem = os.path.splitext(os.path.basename(source))[0]
+                if prefix:
+                    filename = f"{stem}_{prefix}"
+                else:
+                    filename = stem
+            else:
+                # Fallback to index-based naming
+                filename = f"{prefix}_{i + 1}" if prefix else f"{i + 1}"
+
+            # Determine extension
             if source is not None and source.lower().endswith((".tif", ".tiff")):
                 ext = ".tif"
             else:
                 ext = ".png"
 
-            output_path = os.path.join(output_dir, f"{prefix}_{i + 1}{ext}")
+            output_path = os.path.join(output_dir, f"{filename}{ext}")
 
             # Save
-            common.array_to_image(
-                mask_array, output_path, source, dtype=dtype, **kwargs
-            )
+            common.array_to_image(mask_array, output_path, source, dtype=dtype, **kwargs)
             saved_files.append(output_path)
             print(
                 f"Saved {valid_mask_count} mask(s) for image {i + 1} to {output_path}"
@@ -1460,6 +1475,7 @@ class SamGeo3:
         max_size: Optional[int] = None,
         dtype: str = "uint8",
         save_scores: Optional[str] = None,
+        binary: bool = False,
         **kwargs: Any,
     ) -> None:
         """Save the generated masks to a file or generate mask array for visualization.
@@ -1574,13 +1590,32 @@ class SamGeo3:
         # Store the mask array for visualization
         self.objects = mask_array
 
+        # If binary requested, enforce non-unique uint8 mask
+        if binary:
+            unique = False
+            dtype = "uint8"
+
         # Only save to file if output path is provided
         if output is not None:
+            # If user provided a directory, construct filename matching the source
+            if os.path.isdir(output):
+                out_dir = output
+                if self.source is not None:
+                    stem = os.path.splitext(os.path.basename(self.source))[0]
+                else:
+                    stem = "mask"
+                # Choose extension based on source
+                if self.source is not None and self.source.lower().endswith((".tif", ".tiff")):
+                    ext = ".tif"
+                else:
+                    ext = ".png"
+                output_path = os.path.join(out_dir, f"{stem}{ext}")
+            else:
+                output_path = output
+
             # Save using common utility which handles GeoTIFF georeferencing
-            common.array_to_image(
-                mask_array, output, self.source, dtype=dtype, **kwargs
-            )
-            print(f"Saved {valid_mask_count} mask(s) to {output}")
+            common.array_to_image(mask_array, output_path, self.source, dtype=dtype, **kwargs)
+            print(f"Saved {valid_mask_count} mask(s) to {output_path}")
 
             # Save scores if requested
             if save_scores is not None:
@@ -2106,6 +2141,7 @@ class SamGeo3Video:
         output_dir: Optional[str] = None,
         frame_rate: Optional[int] = None,
         prefix: str = "",
+        image_output_dir: Optional[str] = None,
     ) -> None:
         """Load a video or time series images for segmentation.
 
@@ -2135,9 +2171,16 @@ class SamGeo3Video:
             if os.path.isfile(video_path):
                 # MP4 video file - extract frames
                 if output_dir is None:
-                    output_dir = common.make_temp_dir()
-                if not os.path.exists(output_dir):
-                    os.makedirs(output_dir)
+                    # Resolve default image_output_dir at call time to cwd/output/images
+                    if image_output_dir is None:
+                        project_out = os.path.join(os.getcwd(), "output", "images")
+                        output_dir = project_out
+                    else:
+                        output_dir = image_output_dir
+
+                # Ensure absolute path and directory exists
+                output_dir = os.path.abspath(output_dir)
+                os.makedirs(output_dir, exist_ok=True)
                 print(f"Extracting frames to: {output_dir}")
                 common.video_to_images(
                     video_path, output_dir, frame_rate=frame_rate, prefix=prefix
@@ -2548,6 +2591,8 @@ class SamGeo3Video:
         output_dir: str,
         img_ext: str = "png",
         dtype: str = "uint8",
+        binary: bool = True,
+        prefix: Optional[str] = "mask",
     ) -> List[str]:
         """Save segmentation masks to files.
 
@@ -2588,6 +2633,10 @@ class SamGeo3Video:
         if is_geotiff:
             img_ext = "tif"
 
+        # If binary requested, enforce binary behavior
+        if binary:
+            dtype = "uint8"
+
         # Determine frame dimensions once
         if isinstance(self.video_frames[0], str):
             first_frame = load_frame(self.video_frames[0])
@@ -2599,7 +2648,7 @@ class SamGeo3Video:
             frame_data = formatted_outputs[frame_idx]
             mask_array = np.zeros((h, w), dtype=np.uint8)
 
-            # Combine all object masks with unique IDs
+            # Combine all object masks with unique IDs (or binary)
             for obj_id, mask in frame_data.items():
                 mask_np = np.array(mask)
                 if mask_np.ndim > 2:
@@ -2611,16 +2660,26 @@ class SamGeo3Video:
                         (w, h),
                         interpolation=cv2.INTER_NEAREST,
                     )
-                mask_array[mask_np > 0] = obj_id
+                if binary:
+                    mask_array[mask_np > 0] = 255
+                else:
+                    mask_array[mask_np > 0] = obj_id
 
             # Determine output path
+            # Determine output filename. Prefer original frame filename when available.
+            crs_source = None
             if is_geotiff and self._tif_names is not None:
                 base_name = os.path.splitext(self._tif_names[frame_idx])[0]
-                filename = f"{base_name}_mask.{img_ext}"
+                filename = f"{base_name}_{prefix}.{img_ext}" if prefix else f"{base_name}.{img_ext}"
                 crs_source = os.path.join(self._tif_dir, self._tif_names[frame_idx])
             else:
-                filename = f"{str(frame_idx).zfill(num_digits)}.{img_ext}"
-                crs_source = None
+                # If frames are stored as files, use their basename
+                if isinstance(self.video_frames[frame_idx], str):
+                    frame_path = self.video_frames[frame_idx]
+                    stem = os.path.splitext(os.path.basename(frame_path))[0]
+                    filename = f"{stem}_{prefix}.{img_ext}" if prefix else f"{stem}.{img_ext}"
+                else:
+                    filename = f"{str(frame_idx).zfill(num_digits)}.{img_ext}"
 
             output_path = os.path.join(output_dir, filename)
 
