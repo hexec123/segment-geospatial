@@ -3513,6 +3513,7 @@ def video_to_images(
     output_dir: str,
     frame_rate: Optional[int] = None,
     prefix: str = "",
+    img_ext: str = "jpg",
 ) -> None:
     """
     Converts a video into a series of images. Each frame of the video is saved as an image.
@@ -3555,6 +3556,9 @@ def video_to_images(
     frame_count = 0
     saved_frame_count = 0
 
+    # Normalize extension (no leading dot)
+    img_ext = img_ext.lstrip(".")
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -3563,7 +3567,7 @@ def video_to_images(
         # Save frames based on frame_rate
         if frame_count % (video_fps // frame_rate) == 0:
             img_path = os.path.join(
-                output_dir, f"{prefix}{saved_frame_count:0{num_digits}d}.jpg"
+                output_dir, f"{prefix}{saved_frame_count:0{num_digits}d}.{img_ext}"
             )
             cv2.imwrite(img_path, frame)
             saved_frame_count += 1
@@ -3717,6 +3721,7 @@ def geotiff_to_jpg(geotiff_path: str, output_path: str) -> None:
     from PIL import Image
 
     # Open the GeoTIFF file
+    # output_path should include desired extension
     with rasterio.open(geotiff_path) as src:
         # Read the first band (for grayscale) or all bands
         array = src.read()
@@ -3743,7 +3748,7 @@ def geotiff_to_jpg(geotiff_path: str, output_path: str) -> None:
         image.save(output_path)
 
 
-def geotiff_to_jpg_batch(input_folder: str, output_folder: str = None) -> str:
+def geotiff_to_jpg_batch(input_folder: str, output_folder: str = None, img_ext: str = "jpg") -> str:
     """Convert all GeoTIFF files in a folder to JPG files.
 
     Args:
@@ -3765,10 +3770,11 @@ def geotiff_to_jpg_batch(input_folder: str, output_folder: str = None) -> str:
     ]
 
     # Initialize tqdm progress bar
-    for filename in tqdm(geotiff_files, desc="Converting GeoTIFF to JPG"):
+    img_ext = img_ext.lstrip(".")
+    for filename in tqdm(geotiff_files, desc="Converting GeoTIFF to images"):
         geotiff_path = os.path.join(input_folder, filename)
-        jpg_filename = os.path.splitext(filename)[0] + ".jpg"
-        output_path = os.path.join(output_folder, jpg_filename)
+        out_filename = os.path.splitext(filename)[0] + f".{img_ext}"
+        output_path = os.path.join(output_folder, out_filename)
         geotiff_to_jpg(geotiff_path, output_path)
 
     return output_folder

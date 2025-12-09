@@ -2134,6 +2134,8 @@ class SamGeo3Video:
         self._tif_source = None
         self._tif_dir = None
         self._tif_names = None
+        # Preferred image extension for extracted frames (no leading dot)
+        self.image_ext = None
 
     def set_video(
         self,
@@ -2142,6 +2144,7 @@ class SamGeo3Video:
         frame_rate: Optional[int] = None,
         prefix: str = "",
         image_output_dir: Optional[str] = None,
+        image_ext: str = "png",
     ) -> None:
         """Load a video or time series images for segmentation.
 
@@ -2182,8 +2185,14 @@ class SamGeo3Video:
                 output_dir = os.path.abspath(output_dir)
                 os.makedirs(output_dir, exist_ok=True)
                 print(f"Extracting frames to: {output_dir}")
+                # store preferred image extension for later frame loading
+                self.image_ext = image_ext.lstrip(".") if image_ext is not None else None
                 common.video_to_images(
-                    video_path, output_dir, frame_rate=frame_rate, prefix=prefix
+                    video_path,
+                    output_dir,
+                    frame_rate=frame_rate,
+                    prefix=prefix,
+                    img_ext=image_ext,
                 )
                 video_path = output_dir
 
@@ -2198,7 +2207,7 @@ class SamGeo3Video:
                     self._tif_dir = video_path
                     self._tif_names = files
                     # Convert GeoTIFFs to JPEGs for SAM3
-                    video_path = common.geotiff_to_jpg_batch(video_path)
+                    video_path = common.geotiff_to_jpg_batch(video_path, img_ext=image_ext)
                     print(f"Converted GeoTIFFs to JPEGs: {video_path}")
 
             if not os.path.exists(video_path):
@@ -2256,19 +2265,35 @@ class SamGeo3Video:
             else:
                 raise ValueError(f"Failed to load any frames from video: {video_path}")
         else:
-            self.video_frames = glob.glob(os.path.join(video_path, "*.jpg"))
+            # Look for frames with the preferred extension if set, otherwise common image extensions
+            frames = []
+            if getattr(self, "image_ext", None):
+                pattern = f"*.{self.image_ext.lstrip('.') }"
+                frames = glob.glob(os.path.join(video_path, pattern))
+
+            # If none found, fall back to common extensions
+            if not frames:
+                for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp"):
+                    frames.extend(glob.glob(os.path.join(video_path, ext)))
+
+            # Ensure unique and sorted list
+            frames = sorted(list(set(frames)))
+
+            # Try numeric sort if filenames are numbers, otherwise lexicographic
             try:
-                self.video_frames.sort(
-                    key=lambda p: int(os.path.splitext(os.path.basename(p))[0])
-                )
-            except ValueError:
-                self.video_frames.sort()
+                frames.sort(key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
+            except Exception:
+                frames.sort()
+
+            self.video_frames = frames
 
             if self.video_frames:
                 first_frame = load_frame(self.video_frames[0])
                 self.frame_height, self.frame_width = first_frame.shape[:2]
             else:
-                raise ValueError(f"No JPEG frames found in directory: {video_path}")
+                # Report which extension we looked for for clarity
+                looked = self.image_ext if getattr(self, "image_ext", None) else "png/jpg/jpeg/bmp"
+                raise ValueError(f"No frames found with extension(s) {looked} in directory: {video_path}")
 
     def reset(self) -> None:
         """Reset the current session, clearing all prompts and masks.
@@ -2592,7 +2617,7 @@ class SamGeo3Video:
         img_ext: str = "png",
         dtype: str = "uint8",
         binary: bool = True,
-        prefix: Optional[str] = "mask",
+        prefix: Optional[str] = "",
     ) -> List[str]:
         """Save segmentation masks to files.
 
@@ -2611,6 +2636,7 @@ class SamGeo3Video:
             >>> sam.generate_masks("building")
             >>> sam.save_masks("output/masks/")
         """
+        print("Saving masks... Prefix:", prefix)
         if self.outputs_per_frame is None:
             raise ValueError("No masks to save. Please run generate_masks() first.")
 

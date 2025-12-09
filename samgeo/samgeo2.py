@@ -1230,6 +1230,7 @@ class SamGeo2:
         output_dir: str = None,
         frame_rate: Optional[int] = None,
         prefix: str = "",
+        image_ext: str = "png",
     ) -> None:
         """Set the video path and parameters.
 
@@ -1251,7 +1252,7 @@ class SamGeo2:
                         os.makedirs(output_dir)
                 print(f"Output directory: {output_dir}")
                 common.video_to_images(
-                    video_path, output_dir, frame_rate=frame_rate, prefix=prefix
+                    video_path, output_dir, frame_rate=frame_rate, prefix=prefix, img_ext=image_ext
                 )
 
             elif os.path.isdir(video_path):
@@ -1262,7 +1263,7 @@ class SamGeo2:
                     self._tif_source = os.path.join(video_path, files[0])
                     self._tif_dir = video_path
                     self._tif_names = files
-                    video_path = common.geotiff_to_jpg_batch(video_path)
+                    video_path = common.geotiff_to_jpg_batch(video_path, img_ext=image_ext)
                 output_dir = video_path
 
             if not os.path.exists(video_path):

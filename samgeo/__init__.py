@@ -8,3 +8,4 @@ __version__ = "0.15.2"
 from .samgeo import *  # noqa: F403
 from .samgeo2 import *  # noqa: F403
 from .samgeo3 import *  # noqa: F403
+print(">>> LOADED samgeo FROM", __file__)
