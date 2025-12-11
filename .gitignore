@@ -11,16 +11,19 @@ private/
 **/*.shx
 **/*.dbf
 **/*.jpg
-# **/*.png
+**/*.png
 **/*.csv
 **/*.pt
 *.mp4
+*.mov
 *.webp
 samgeo/assets/
 docs/examples/segments/
 docs/examples/blended/
 docs/examples/*.png
 output/
+tests/output/
+tests/input/
 
 docs/examples/*.geojson
 

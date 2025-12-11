@@ -3489,8 +3489,7 @@ def images_to_video(
         height, width, _ = frame.shape
         video_size = (width, height)
 
-    # TODO: This video codec is giving me some problems, not sure if it's the correct one
-    fourcc = cv2.VideoWriter_fourcc(*"avc1")  # Define the codec for mp4
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # Define the codec for mp4
     video_writer = cv2.VideoWriter(output_video, fourcc, fps, video_size)
 
     for image_path in images:

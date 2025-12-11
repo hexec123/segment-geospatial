@@ -7,9 +7,11 @@ import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
+import subprocess
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+import logging
 
 try:
     from sam3.model_builder import build_sam3_image_model, build_sam3_video_predictor
@@ -19,6 +21,9 @@ try:
     SAM3_META_AVAILABLE = True
 except ImportError:
     SAM3_META_AVAILABLE = False
+
+# Module logger
+logger = logging.getLogger(__name__)
 
 try:
     from transformers import Sam3Model, Sam3Processor as TransformersSam3Processor
@@ -1599,17 +1604,11 @@ class SamGeo3:
         if output is not None:
             # If user provided a directory, construct filename matching the source
             if os.path.isdir(output):
-                out_dir = output
                 if self.source is not None:
-                    stem = os.path.splitext(os.path.basename(self.source))[0]
+                    filename = os.path.basename(self.source) + ".png"
+                    output_path = os.path.join(output, filename)
                 else:
-                    stem = "mask"
-                # Choose extension based on source
-                if self.source is not None and self.source.lower().endswith((".tif", ".tiff")):
-                    ext = ".tif"
-                else:
-                    ext = ".png"
-                output_path = os.path.join(out_dir, f"{stem}{ext}")
+                    output_path = os.path.join(output, "mask.png")
             else:
                 output_path = output
 
@@ -2127,7 +2126,11 @@ class SamGeo3Video:
         self.gpus_to_use = gpus_to_use
         self.session_id = None
         self.video_path = None
+        # `video_frames` will store frame file paths (strings). Avoid keeping full
+        # numpy arrays for every frame in memory to reduce OOM risk.
         self.video_frames = None
+        # small in-memory cache for recently accessed frames (frame_idx -> ndarray)
+        self._frame_cache: Dict[int, np.ndarray] = {}
         self.outputs_per_frame = None
         self.frame_width = None
         self.frame_height = None
@@ -2251,29 +2254,23 @@ class SamGeo3Video:
         Args:
             video_path (str): Path to video file or frame directory.
         """
-        if isinstance(video_path, str) and video_path.endswith(".mp4"):
-            cap = cv2.VideoCapture(video_path)
-            self.video_frames = []
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                self.video_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            cap.release()
-            if self.video_frames:
-                self.frame_height, self.frame_width = self.video_frames[0].shape[:2]
-            else:
-                raise ValueError(f"Failed to load any frames from video: {video_path}")
+        # To avoid keeping all frames in memory, always register frame file paths
+        # (or video path) and lazily load frames on demand via `get_frame`
+        frames = []
+        # If video_path is a file (mp4, mov), try to extract frames to images first
+        if isinstance(video_path, str) and os.path.isfile(video_path) and video_path.lower().endswith((".mp4", ".mov", ".avi")):
+            # Prefer previously-extracted image directory if set by set_video.
+            # If not, we still record the video file path and lazy-read frames via cv2 when requested.
+            frames = [video_path]
         else:
             # Look for frames with the preferred extension if set, otherwise common image extensions
-            frames = []
             if getattr(self, "image_ext", None):
                 pattern = f"*.{self.image_ext.lstrip('.') }"
                 frames = glob.glob(os.path.join(video_path, pattern))
 
             # If none found, fall back to common extensions
             if not frames:
-                for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp"):
+                for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff"):
                     frames.extend(glob.glob(os.path.join(video_path, ext)))
 
             # Ensure unique and sorted list
@@ -2285,15 +2282,89 @@ class SamGeo3Video:
             except Exception:
                 frames.sort()
 
-            self.video_frames = frames
+        self.video_frames = frames
 
-            if self.video_frames:
-                first_frame = load_frame(self.video_frames[0])
-                self.frame_height, self.frame_width = first_frame.shape[:2]
-            else:
-                # Report which extension we looked for for clarity
-                looked = self.image_ext if getattr(self, "image_ext", None) else "png/jpg/jpeg/bmp"
-                raise ValueError(f"No frames found with extension(s) {looked} in directory: {video_path}")
+        if not self.video_frames:
+            looked = self.image_ext if getattr(self, "image_ext", None) else "png/jpg/jpeg/bmp"
+            raise ValueError(f"No frames found with extension(s) {looked} in directory: {video_path}")
+
+        # Determine dimensions from first frame (lazy load)
+        first = self.get_frame(0)
+        self.frame_height, self.frame_width = first.shape[:2]
+
+        # Clear any small cache (start fresh)
+        self._frame_cache.clear()
+
+    def get_frame(self, frame_idx: int) -> np.ndarray:
+        """Lazily load a single frame (H,W,3 RGB) and cache a few recent frames.
+
+        This avoids keeping all frames in memory and reduces peak usage.
+        """
+        # Return cached if present
+        if frame_idx in self._frame_cache:
+            return self._frame_cache[frame_idx]
+
+        if self.video_frames is None or frame_idx < 0 or frame_idx >= len(self.video_frames):
+            raise IndexError(f"Frame index {frame_idx} out of range")
+
+        path_or_video = self.video_frames[frame_idx]
+
+        # If path points to a video file, read the single frame via cv2
+        if isinstance(path_or_video, str) and path_or_video.lower().endswith((".mp4", ".mov", ".avi")):
+            cap = cv2.VideoCapture(path_or_video)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame = cap.read()
+            cap.release()
+            if not ok:
+                raise RuntimeError(f"Unable to read frame {frame_idx} from {path_or_video}")
+            img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        else:
+            # Otherwise treat as image file path
+            img = load_frame(path_or_video)
+
+        # Cache and bounded size
+        self._frame_cache[frame_idx] = img
+        if len(self._frame_cache) > 8:
+            # drop the oldest inserted item
+            oldest = next(iter(self._frame_cache))
+            self._frame_cache.pop(oldest, None)
+
+        return img
+
+    def _pick_least_used_gpu(self) -> Optional[int]:
+        """Return the GPU index with the most free memory, or None if not available.
+
+        Tries to use nvidia-smi; falls back to torch if available. This is a best-effort
+        heuristic and may not be perfect in all environments (containers, multi-user).
+        """
+        try:
+            # Query free memory per GPU (MB)
+            out = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.free",
+                    "--format=csv,noheader,nounits",
+                ],
+                encoding="utf-8",
+            )
+            frees = [int(x.strip()) for x in out.strip().splitlines() if x.strip()]
+            if len(frees) == 0:
+                logger.debug("_pick_least_used_gpu: nvidia-smi returned no GPUs")
+                return None
+            # pick GPU with max free memory
+            choice = int(np.argmax(frees))
+            logger.debug("_pick_least_used_gpu: frees=%s chosen=%s", frees, choice)
+            return choice
+        except Exception:
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    logger.debug("_pick_least_used_gpu: torch reports cuda available, returning 0")
+                    return 0
+            except Exception:
+                pass
+        return None
 
     def reset(self) -> None:
         """Reset the current session, clearing all prompts and masks.
@@ -2317,6 +2388,8 @@ class SamGeo3Video:
         prompt: str,
         frame_idx: int = 0,
         propagate: bool = True,
+        negative_prompt: Optional[str] = None,
+        negative_overlap_threshold: float = 0.3,
     ) -> Dict[int, Any]:
         """Generate masks using a text prompt.
 
@@ -2341,7 +2414,7 @@ class SamGeo3Video:
         # Reset prompts before adding new text prompt
         self.reset()
 
-        # Add text prompt
+        # Add positive text prompt to the current session
         response = self.predictor.handle_request(
             request=dict(
                 type="add_prompt",
@@ -2361,8 +2434,124 @@ class SamGeo3Video:
             f"Found {num_objects} object(s) matching '{prompt}' on frame {frame_idx}."
         )
 
+        # Collect propagation outputs for positive prompt (without mutating self.outputs_per_frame)
+        pos_outputs = {}
         if propagate:
-            self.propagate()
+            for response in self.predictor.handle_stream_request(
+                request=dict(type="propagate_in_video", session_id=self.session_id)
+            ):
+                pos_outputs[response["frame_index"]] = response["outputs"]
+        else:
+            # If not propagating, keep only the add_prompt response for the given frame
+            pos_outputs[frame_idx] = out
+
+        # If a negative prompt is provided, run it in a temporary session and filter results
+        if negative_prompt is not None:
+            # start a temporary session for the negative prompt
+            logger.info(
+                "Starting negative prompt session for '%s' (propagate=%s)",
+                negative_prompt,
+                propagate,
+            )
+            neg_session_resp = self.predictor.handle_request(
+                request=dict(type="start_session", resource_path=self.video_path)
+            )
+            neg_session_id = neg_session_resp["session_id"]
+
+            try:
+                # add negative prompt and collect outputs
+                neg_resp = self.predictor.handle_request(
+                    request=dict(
+                        type="add_prompt",
+                        session_id=neg_session_id,
+                        frame_index=frame_idx,
+                        text=negative_prompt,
+                    )
+                )
+
+                # If propagate is True, collect propagated negative outputs across frames.
+                # Otherwise, only use the add_prompt response for the specified frame.
+                neg_outputs = {}
+                if propagate:
+                    # Log GPU selection decision for negative propagation (best-effort)
+                    gpu_choice = self._pick_least_used_gpu()
+                    logger.info(
+                        "Negative propagation will try to use GPU %s (None implies CPU/fallback)",
+                        gpu_choice,
+                    )
+                    for response in self.predictor.handle_stream_request(
+                        request=dict(type="propagate_in_video", session_id=neg_session_id)
+                    ):
+                        neg_outputs[response["frame_index"]] = response["outputs"]
+                else:
+                    neg_outputs[frame_idx] = neg_resp.get("outputs", {})
+
+                # Format both positive and negative outputs into {frame: {obj_id: mask}}
+                # Reuse _format_outputs by temporarily assigning outputs_per_frame
+                saved_outputs = self.outputs_per_frame
+
+                self.outputs_per_frame = pos_outputs
+                formatted_pos = self._format_outputs()
+
+                self.outputs_per_frame = neg_outputs
+                formatted_neg = self._format_outputs()
+
+                # restore
+                self.outputs_per_frame = saved_outputs
+
+                # helper to compute IoU
+                def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+                    if a.shape != b.shape:
+                        return 0.0
+                    a_bool = a > 0
+                    b_bool = b > 0
+                    inter = np.logical_and(a_bool, b_bool).sum()
+                    union = np.logical_or(a_bool, b_bool).sum()
+                    if union == 0:
+                        return 0.0
+                    return float(inter) / float(union)
+
+                # Filter positive masks that overlap too much with any negative mask
+                cleaned = {}
+                for frame_idx_k, pos_dict in formatted_pos.items():
+                    cleaned[frame_idx_k] = {}
+                    neg_dict = formatted_neg.get(frame_idx_k, {})
+                    for pos_obj_id, pos_mask in pos_dict.items():
+                        keep = True
+                        for neg_obj_id, neg_mask in neg_dict.items():
+                            iou = _mask_iou(pos_mask, neg_mask)
+                            if iou >= negative_overlap_threshold:
+                                keep = False
+                                break
+                        if keep:
+                            cleaned[frame_idx_k][pos_obj_id] = pos_mask
+
+                # Set outputs_per_frame to cleaned (already in formatted {obj_id: mask} form)
+                self.outputs_per_frame = cleaned
+                print(
+                    f"Applied negative prompt filtering ('{negative_prompt}'), "
+                    f"removed overlapping positive objects with IoU>={negative_overlap_threshold}"
+                )
+
+                logger.info(
+                    "Finished negative prompt session for '%s' (propagate=%s)",
+                    negative_prompt,
+                    propagate,
+                )
+                return self.outputs_per_frame
+            finally:
+                # close temporary negative session
+                try:
+                    self.predictor.handle_request(
+                        request=dict(type="close_session", session_id=neg_session_id)
+                    )
+                except Exception:
+                    pass
+
+        # Store positive propagation outputs in the instance for both
+        # propagate=True and propagate=False (single-frame case).
+        self.outputs_per_frame = pos_outputs
+        return self.outputs_per_frame
 
     def add_point_prompts(
         self,
